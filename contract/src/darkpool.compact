@@ -1,0 +1,131 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// ============================================================================
+// DarkPool DEX — a shielded constant-product AMM on Midnight.
+//
+// Compact has no division operator inside circuits (division is not ZK-native),
+// so the quotients for the swap are computed off-circuit and PROVEN correct here
+// using multiplication-only range checks:  out*denom <= numer < (out+1)*denom.
+//
+// The pool reserves are public (needed for price discovery); the protocol
+// treasury accumulates the fee on every swap — that is the protocol's revenue.
+// ============================================================================
+
+// --- Pool reserves (public) -------------------------------------------------
+export ledger reserveA: Uint<64>;
+export ledger reserveB: Uint<64>;
+
+// --- Protocol revenue: fees skimmed into the treasury (one per token) -------
+export ledger treasuryA: Uint<64>;
+export ledger treasuryB: Uint<64>;
+
+// --- Fee in basis points (25 = 0.25%) ---------------------------------------
+export ledger feeBps: Uint<64>;
+
+// --- Number of swaps executed ----------------------------------------------
+export ledger tradeCount: Counter;
+
+constructor() {
+  reserveA = 0;
+  reserveB = 0;
+  treasuryA = 0;
+  treasuryB = 0;
+  feeBps = 25;
+}
+
+// Seed / add liquidity to the pool (demo: single provider).
+export circuit addLiquidity(amountA: Uint<64>, amountB: Uint<64>): [] {
+  reserveA = disclose((reserveA + amountA) as Uint<64>);
+  reserveB = disclose((reserveB + amountB) as Uint<64>);
+}
+
+// Swap token A in for token B out.
+//   amountIn : tokens sent in
+//   fee      : floor(amountIn * feeBps / 10000)   -- computed off-circuit
+//   amountOut: floor(inAfterFee * reserveB / (reserveA + inAfterFee)) -- off-circuit
+// The circuit re-derives nothing by division; it PROVES the supplied quotients
+// are the correct floors using only +, -, *.
+export circuit swapAforB(
+  amountIn: Uint<64>,
+  fee: Uint<64>,
+  amountOut: Uint<64>,
+  minOut: Uint<64>
+): Uint<64> {
+  assert(amountIn > 0, "amountIn must be positive");
+  assert(reserveA > 0, "empty pool");
+  assert(reserveB > 0, "empty pool");
+  assert(fee <= amountIn, "fee exceeds input");
+
+  // --- Prove: fee == floor(amountIn * feeBps / 10000) ---
+  // Products of two Uint<64> fit in Uint<128> (max product width is 254 bits).
+  const feeNumer = amountIn * feeBps;         // <= 128 bits
+  const feeLo = fee * 10000;
+  const feeHi = (fee + 1) * 10000;
+  assert(feeNumer >= feeLo, "fee too low");
+  assert(feeNumer < feeHi, "fee too high");
+
+  const amountInAfterFee = (amountIn - fee) as Uint<64>;
+
+  // --- Prove: amountOut == floor(inAfterFee * reserveB / (reserveA + inAfterFee)) ---
+  const numer = amountInAfterFee * reserveB;  // <= 128 bits
+  const denom = reserveA + amountInAfterFee;  // <= 65 bits
+  const outLo = amountOut * denom;            // <= 129 bits
+  const outHi = (amountOut + 1) * denom;
+  assert(numer >= outLo, "amountOut too high");
+  assert(numer < outHi, "amountOut too low");
+
+  assert(amountOut >= minOut, "slippage: output below minimum");
+  assert(amountOut < reserveB, "insufficient liquidity");
+
+  // --- Settle: update pool + accrue protocol revenue ---
+  // The swap inputs are private witnesses; settling into the public pool
+  // necessarily reveals the net reserve deltas, so we disclose() them
+  // explicitly. (Trader identity and pre-trade intent stay hidden — that is
+  // what defeats front-running.)
+  reserveA = disclose((reserveA + amountInAfterFee) as Uint<64>);
+  treasuryA = disclose((treasuryA + fee) as Uint<64>);
+  reserveB = disclose((reserveB - amountOut) as Uint<64>);
+
+  tradeCount.increment(1);
+  return disclose(amountOut);
+}
+
+// Swap token B in for token A out (mirror of swapAforB).
+export circuit swapBforA(
+  amountIn: Uint<64>,
+  fee: Uint<64>,
+  amountOut: Uint<64>,
+  minOut: Uint<64>
+): Uint<64> {
+  assert(amountIn > 0, "amountIn must be positive");
+  assert(reserveA > 0, "empty pool");
+  assert(reserveB > 0, "empty pool");
+  assert(fee <= amountIn, "fee exceeds input");
+
+  const feeNumer = amountIn * feeBps;
+  const feeLo = fee * 10000;
+  const feeHi = (fee + 1) * 10000;
+  assert(feeNumer >= feeLo, "fee too low");
+  assert(feeNumer < feeHi, "fee too high");
+
+  const amountInAfterFee = (amountIn - fee) as Uint<64>;
+
+  const numer = amountInAfterFee * reserveA;
+  const denom = reserveB + amountInAfterFee;
+  const outLo = amountOut * denom;
+  const outHi = (amountOut + 1) * denom;
+  assert(numer >= outLo, "amountOut too high");
+  assert(numer < outHi, "amountOut too low");
+
+  assert(amountOut >= minOut, "slippage: output below minimum");
+  assert(amountOut < reserveA, "insufficient liquidity");
+
+  reserveB = disclose((reserveB + amountInAfterFee) as Uint<64>);
+  treasuryB = disclose((treasuryB + fee) as Uint<64>);
+  reserveA = disclose((reserveA - amountOut) as Uint<64>);
+
+  tradeCount.increment(1);
+  return disclose(amountOut);
+}
