@@ -2,13 +2,14 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Scene from './Scene.jsx';
 import { api } from './api.js';
 import { listInjectedWallets, waitForWallets, connectWallet, readWalletSummary, NETWORK_ID } from './wallet.js';
+import { loadGame, applySwap, applyEvent, rankFor, RANKS, ACHIEVEMENTS } from './game.js';
 
 const fmt = (v) => Number(v).toLocaleString('en-US');
 const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
 const TOKENS = { A: 'nUSD', B: 'aUSD' };
 const AMOUNT_CHIPS = [50000, 100000, 250000, 500000];
 const SLIPPAGES = [0.1, 0.5, 1.0];
-const ROUTES = [['Swap', 'swap'], ['Pool', 'pool'], ['Activity', 'activity'], ['How it works', 'how']];
+const ROUTES = [['Swap', 'swap'], ['Pool', 'pool'], ['Activity', 'activity'], ['Rank', 'rank'], ['How it works', 'how']];
 
 const I = {
   shield: (p) => (<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" {...p}><path d="M12 3l7 3v5c0 4.4-3 7.7-7 9-4-1.3-7-4.6-7-9V6l7-3z"/></svg>),
@@ -20,6 +21,9 @@ const I = {
   scale: (p) => (<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" {...p}><path d="M12 3v18M7 6h10M5 6l-3 6h6L5 6zM19 6l-3 6h6l-3-6z"/></svg>),
   doc: (p) => (<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7" {...p}><path d="M14 3H6v18h12V7l-4-4z"/><path d="M14 3v4h4M8 13h8M8 17h6"/></svg>),
   x: (p) => (<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" {...p}><path d="M6 6l12 12M18 6L6 18"/></svg>),
+  star: (p) => (<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7" {...p}><path d="M12 3l2.7 5.8 6.3.8-4.6 4.4 1.2 6.2L12 17.2 6.4 20.2l1.2-6.2L3 9.6l6.3-.8L12 3z"/></svg>),
+  flame: (p) => (<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7" {...p}><path d="M12 3c1 3-3 4.5-3 8a3 3 0 006 0c0-1.2-.5-2-.5-2 2 1 3.5 3 3.5 5.5A6 6 0 016 14.5C6 9.5 11 8 12 3z"/></svg>),
+  lock: (p) => (<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.7" {...p}><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>),
 };
 
 const Coin = ({ t }) => (<span className={`coin ${t === TOKENS.A ? 'a' : 'b'}`}>{t[0]}</span>);
@@ -42,6 +46,20 @@ export default function App() {
   const [receipt, setReceipt] = useState(null);
   const [route, setRoute] = useState(routeFromHash());
   const stepTimer = useRef([]);
+
+  // ---- gamification ----
+  const [game, setGame] = useState(loadGame);
+  const [awards, setAwards] = useState([]); // queued unlock/rank-up toasts
+  const rk = useMemo(() => rankFor(game.xp), [game.xp]);
+  const pushAwards = ({ unlocked, rankUp }) => {
+    const items = [
+      ...(rankUp ? [{ key: `rank-${rankUp.name}-${Date.now()}`, kind: 'rank', title: `Rank up — ${rankUp.name}`, desc: rankUp.note }] : []),
+      ...unlocked.map((a) => ({ key: `ach-${a.id}`, kind: 'ach', title: `Achievement — ${a.name}`, desc: `${a.desc} · +75 XP`, icon: a.icon })),
+    ];
+    if (!items.length) return;
+    setAwards((q) => [...q, ...items]);
+    items.forEach((it) => setTimeout(() => setAwards((q) => q.filter((x) => x.key !== it.key)), 7000));
+  };
 
   // ---- browser wallet connect ----
   const [walletModal, setWalletModal] = useState(false);
@@ -122,7 +140,9 @@ export default function App() {
     try {
       const r = await api.swap(n, dir, minOut);
       setStep(4); setState(r.state); setPulse((p) => p + 1); setMevSaved((m) => m + mevEstimate);
-      setToast({ ...r.swap, txId: r.txId, ms: r.proofMs, receiptId: r.receiptId });
+      const g = applySwap(game, { amountIn: n, dir, mev: mevEstimate });
+      setGame(g.next); pushAwards(g);
+      setToast({ ...r.swap, txId: r.txId, ms: r.proofMs, receiptId: r.receiptId, xp: g.gainedXp });
       setTimeout(() => setToast(null), 9000);
       refresh();
     } catch (e) { setErr(String(e.message || e)); }
@@ -132,7 +152,13 @@ export default function App() {
     }
   };
 
-  const openReceipt = async (id) => { try { setReceipt(await api.receipt(id)); } catch (e) { setErr(String(e.message || e)); } };
+  const openReceipt = async (id) => {
+    try {
+      setReceipt(await api.receipt(id));
+      const g = applyEvent(game, (s) => { s.receipts += 1; });
+      setGame(g.next); pushAwards(g);
+    } catch (e) { setErr(String(e.message || e)); }
+  };
   const downloadReceipt = (r) => {
     const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -225,6 +251,34 @@ export default function App() {
     </div>
   );
 
+  const streakLive = Date.now() - game.stats.lastSwapAt <= 3 * 60 * 1000 && game.stats.streak > 1;
+  const unlockedCount = Object.keys(game.unlocked).length;
+
+  const RankCard = () => (
+    <div className="card">
+      <div className="hd"><h3>Trader rank</h3><p>Earn XP for every private swap. <a href="#/rank" onClick={(e) => { e.preventDefault(); go('rank'); }}>Ranks &amp; badges →</a></p></div>
+      <div className="rankcard">
+        <div className="rk-row">
+          <div className="rk-medal"><I.star /></div>
+          <div className="rk-main">
+            <b>{rk.rank.name}</b>
+            <span>Level {rk.level} · {fmt(game.xp)} XP{rk.next ? ` · ${fmt(rk.next.xp - game.xp)} to ${rk.next.name}` : ' · max rank'}</span>
+          </div>
+          {streakLive && <span className="rk-streak" title="Combo — swaps within 3 min keep it alive"><I.flame /> ×{game.stats.streak}</span>}
+        </div>
+        <div className="rk-track"><div className="rk-fill" style={{ width: `${Math.round(rk.progress * 100)}%` }} /></div>
+        <div className="rk-badges">
+          {ACHIEVEMENTS.map((a) => (
+            <span key={a.id} className={`rk-badge ${game.unlocked[a.id] ? 'on' : ''}`} title={`${a.name} — ${a.desc}`}>
+              {game.unlocked[a.id] ? (I[a.icon] || I.star)() : <I.lock />}
+            </span>
+          ))}
+          <span className="rk-count">{unlockedCount}/{ACHIEVEMENTS.length}</span>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <>
       <header className="topbar">
@@ -240,6 +294,9 @@ export default function App() {
             ))}
           </nav>
           <div className="nav-spacer" />
+          <button className="pill rank-pill" title="Your trader rank" onClick={() => go('rank')}>
+            <span className="rp-ic"><I.star /></span>{rk.rank.name} · <b>{fmt(game.xp)} XP</b>
+          </button>
           <span className="pill nav-net"><span className={`dot ${online ? '' : 'off'}`} />{online ? 'Live' : 'Offline'} · Midnight local</span>
           {wallet ? (
             <button className="wallet-btn on" title={wallet.summary.unshieldedAddr} onClick={disconnectWallet}>
@@ -279,6 +336,7 @@ export default function App() {
                 <div className="card"><div className="hd"><h3>Live pool</h3><p>Updates on every swap. <a href="#/pool" onClick={(e) => { e.preventDefault(); go('pool'); }}>Full details →</a></p></div>
                   <StatsGrid /><ReserveBar />
                 </div>
+                <RankCard />
               </div>
             </section>
           </>
@@ -324,6 +382,53 @@ export default function App() {
               <div className="card"><Feed /></div>
               <div className="card note-card">
                 <div className="hd"><h3>Selective disclosure</h3><p>Each swap generates a signed audit receipt. Open one and export it to prove a trade to a regulator or auditor — while the chain still reveals nothing to anyone else.</p></div>
+              </div>
+            </section>
+          </>
+        )}
+
+        {/* ---------------- RANK ---------------- */}
+        {route === 'rank' && (
+          <>
+            <div className="pagehead">
+              <div className="eyebrow">Trader profile</div>
+              <h1 className="ph-title">The quieter you trade,<br />the louder your rank.</h1>
+              <p className="ph-sub">Every private swap earns XP — bigger trades, quick combos, and audit receipts earn more. Nothing here touches the chain: your record stays on your machine, like your trade sizes.</p>
+            </div>
+            <section className="stack">
+              <RankCard />
+              <div className="card">
+                <div className="hd"><h3>Rank ladder</h3><p>+40 XP per swap, plus size and combo bonuses. Achievements pay +75 XP each.</p></div>
+                <div className="ladder">
+                  {RANKS.map((r, i) => (
+                    <div key={r.name} className={`lrow ${rk.level === i + 1 ? 'now' : ''} ${game.xp >= r.xp ? 'past' : ''}`}>
+                      <span className="ln">{i + 1}</span>
+                      <div className="lmain"><b>{r.name}</b><span>{r.note}</span></div>
+                      <b className="lxp">{fmt(r.xp)} XP</b>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="card">
+                <div className="hd"><h3>Achievements</h3><p>{unlockedCount} of {ACHIEVEMENTS.length} unlocked.</p></div>
+                <div className="achgrid">
+                  {ACHIEVEMENTS.map((a) => (
+                    <div key={a.id} className={`ach ${game.unlocked[a.id] ? 'on' : ''}`}>
+                      <span className="aic">{game.unlocked[a.id] ? (I[a.icon] || I.star)() : <I.lock />}</span>
+                      <div><b>{a.name}</b><span>{a.desc}</span></div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="card">
+                <div className="hd"><h3>Lifetime stats</h3></div>
+                <div className="details">
+                  <div className="drow"><span>Private swaps settled</span><b>{fmt(game.stats.swaps)}</b></div>
+                  <div className="drow"><span>Volume hidden from the mempool</span><b>{fmt(game.stats.volume)}</b></div>
+                  <div className="drow"><span>Largest shielded swap</span><b>{fmt(game.stats.maxSwap)}</b></div>
+                  <div className="drow"><span>Est. MEV protected</span><b>{fmt(game.stats.mev)}</b></div>
+                  <div className="drow"><span>Best combo</span><b>×{game.stats.streakBest}</b></div>
+                </div>
               </div>
             </section>
           </>
@@ -387,6 +492,17 @@ export default function App() {
         </div>
       )}
 
+      {awards.length > 0 && (
+        <div className="awards">
+          {awards.map((a) => (
+            <div key={a.key} className={`award ${a.kind}`} onClick={() => setAwards((q) => q.filter((x) => x.key !== a.key))}>
+              <span className="aw-ic">{a.kind === 'rank' ? <I.star /> : (I[a.icon] || I.star)()}</span>
+              <div><b>{a.title}</b><span>{a.desc}</span></div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {toast && toast.info && (
         <div className="toast" onClick={() => setToast(null)}>
           <div className="t"><I.shield /> Demo wallet</div><div className="d">{toast.info}</div>
@@ -395,7 +511,7 @@ export default function App() {
       {toast && !toast.info && (
         <div className="toast">
           <div className="t"><I.check /> Swap settled privately</div>
-          <div className="d">{fmt(toast.amountIn)} {toast.tokenIn} → {fmt(toast.amountOut)} {toast.tokenOut} · fee {fmt(toast.fee)} · proof {(toast.ms / 1000).toFixed(1)}s</div>
+          <div className="d">{fmt(toast.amountIn)} {toast.tokenIn} → {fmt(toast.amountOut)} {toast.tokenOut} · fee {fmt(toast.fee)} · proof {(toast.ms / 1000).toFixed(1)}s{toast.xp ? <b className="txp"> +{toast.xp} XP</b> : null}</div>
           {toast.receiptId && <button className="tbtn" onClick={() => openReceipt(toast.receiptId)}>View audit receipt</button>}
         </div>
       )}

@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://volunteer-accommodations-tables-sunday.trycloudflare.com/api/:path*" }
+  ]
+}
